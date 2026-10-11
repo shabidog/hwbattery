@@ -1,0 +1,52 @@
+name: CI
+
+# 主分支提交即构建并归档产物；PR 也跑同一套，保证合并前就知道会不会坏。
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # 自带 mingw-w64，不依赖 runner 预装的版本，保证可复现。
+      # 项目只需要 gcc 与 windres（见 src/build.bat）。
+      - name: Set up mingw-w64
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: false
+          install: mingw-w64-x86_64-gcc
+
+      - name: Build
+        shell: cmd
+        run: |
+          set "PATH=C:\msys64\mingw64\bin;%PATH%"
+          where gcc
+          where windres
+          src\build.bat
+
+      # 产物应是带 PE 资源（版本信息 + 清单 + 图标）的 exe。
+      # 这里顺带验证版本信息确实写进去了——rc 编译被跳过时能立刻发现。
+      - name: Verify PE version info
+        shell: pwsh
+        run: |
+          $exe = Resolve-Path release/hwbattery.exe
+          $vi = (Get-Item $exe).VersionInfo
+          Write-Host "FileDescription : $($vi.FileDescription)"
+          Write-Host "ProductName     : $($vi.ProductName)"
+          Write-Host "FileVersion     : $($vi.FileVersion)"
+          if (-not $vi.FileDescription) { throw "VERSIONINFO 未写入，检查 windres 步骤" }
+          if ($vi.OriginalFilename -ne "hwbattery.exe") { throw "OriginalFilename 不符" }
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: hwbattery-exe
+          path: release/hwbattery.exe
+          if-no-files-found: error

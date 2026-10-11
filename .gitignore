@@ -1,0 +1,62 @@
+# 环境变量与密钥（保留 .env.example / .env.template 模板）
+.env
+.env.*
+!.env.example
+!.env.template
+
+# 工具缓存 / 会话文件
+.codegraph/
+.superpowers/
+
+# 日志
+logs/
+*.log
+
+# IDE
+.idea/
+.vscode/
+*.iml
+*.ipr
+*.iws
+.classpath
+.project
+.settings/
+
+# 系统与通用临时文件
+Thumbs.db
+Desktop.ini
+.DS_Store
+*.tmp
+*.temp
+*~
+*.swp
+*.bak
+
+#ai
+/PROJECT_MEMORY.md
+AGENTS.md
+CLAUDE.md
+
+# AI 工具的配置、技能与会话缓存（不是项目代码，不入库）
+.atomcode/
+.claude/
+.cursor/
+.agents/
+skills/
+mcp.json
+
+# Git worktree（隔离工作区）
+.worktrees/
+
+# 发布产物（build-release.ps1 生成）
+release/
+
+# 编译产物兜底
+# 正式产物统一由 src/build.bat 输出到 release/（上面已忽略）；
+# 这里再兜一层，防止误在源码目录构建后把二进制提交进来。
+*.exe
+*.o
+*.obj
+*.dll
+__pycache__/
+*.pyc

@@ -1,0 +1,68 @@
+/* hwbattery.rc —— exe 的 PE 资源：版本信息 + 应用清单
+ *
+ * 编译（build.bat 里已包含）：
+ *     windres --codepage=65001 -O coff hwbattery.rc -o hwbattery_res.o
+ * 本文件须以 UTF-8 保存。与 .bat 不同，windres 不会用 OEM 代码页去猜，
+ * 但仍显式声明 code_page 以免工具链默认值不同。
+ *
+ * 作者字段（CompanyName / LegalCopyright）刻意留空：
+ * 本工具是第三方实现，在文件属性里填 HUAWEI 等于声明作者是华为，与事实不符。
+ * 需要填写请改下面两个值，然后重新编译。
+ */
+
+#pragma code_page(65001)
+
+#include <winver.h>
+
+/* RT_MANIFEST = 24，资源 id 1 */
+1 24 "hwbattery.manifest"
+
+/* 应用图标：id 1。Windows 取最小 id 的图标作为资源管理器默认显示图标，
+ * 并按场景从同一个 .ico 里挑 16/20/24/32/40/48/64/128/256 中最合适的一档。 */
+1 ICON "hwbattery.ico"
+
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION     1,0,0,0
+ PRODUCTVERSION  1,0,0,0
+ FILEFLAGSMASK   0x3fL
+ FILEFLAGS       0x0L
+ FILEOS          VOS_NT_WINDOWS32
+ FILETYPE        VFT_APP
+ FILESUBTYPE     VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        /* 简体中文，Unicode 代码页 1200 */
+        BLOCK "080404B0"
+        BEGIN
+            VALUE "FileDescription",  "华为笔记本充电保护功能"
+            VALUE "ProductName",      "华为笔记本充电保护"
+            VALUE "FileVersion",      "1.0.0.0"
+            VALUE "ProductVersion",   "1.0.0.0"
+            VALUE "InternalName",     "hwbattery"
+            VALUE "OriginalFilename", "hwbattery.exe"
+            VALUE "Comments",         "通过 ACPI-WMI (HWMI 命令字 0x1003) 设置充电阈值；容量与健康度经 SetupAPI/IOCTL 读取"
+            VALUE "CompanyName",      ""
+            VALUE "LegalCopyright",   ""
+        END
+
+        /* 英文（美国），Unicode 代码页 1200 —— 让非中文系统也能读到信息 */
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "FileDescription",  "Huawei laptop battery charge protection"
+            VALUE "ProductName",      "Huawei laptop charge protection"
+            VALUE "FileVersion",      "1.0.0.0"
+            VALUE "ProductVersion",   "1.0.0.0"
+            VALUE "InternalName",     "hwbattery"
+            VALUE "OriginalFilename", "hwbattery.exe"
+            VALUE "Comments",         "Sets the charge threshold via ACPI-WMI (HWMI command 0x1003); capacity and health are read through SetupAPI/IOCTL"
+            VALUE "CompanyName",      ""
+            VALUE "LegalCopyright",   ""
+        END
+    END
+
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0804, 1200, 0x0409, 1200
+    END
+END
