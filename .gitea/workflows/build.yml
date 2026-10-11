@@ -1,0 +1,99 @@
+name: Build
+
+# Gitea Actions 的语法与 GitHub Actions 基本兼容，故本文件与 .github/workflows/ 保持
+# 同一套构建步骤：都只是调用 src/build.bat，构建参数只保留在脚本那一处。
+#
+# 部署前请对照自建 runner 的两点（这是与 GitHub 托管 runner 的主要差别）：
+#   1) runs-on 用的是 **runner 注册时配置的标签**，不是 GitHub 的托管镜像名。
+#      本项目需要 Windows；若你的 runner 标签不叫 windows-latest，改成实际标签。
+#   2) 构建依赖 mingw-w64 的 gcc 与 windres 在 PATH 中（build.bat 会自检并报错）。
+#      自建 runner 需预先装好，或在下面的步骤里先安装。
+#   3) 用到的 actions（checkout / upload-artifact）需要 runner 能取到 action 源。
+#      LAN 内不通外网时，需改用 Gitea 自带或自建的 action。
+
+on:
+  push:
+    branches: [ main ]
+    tags: [ 'v*' ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # 与 GitHub 侧完全同一套构建步骤
+      - name: Build
+        shell: cmd
+        run: src\build.bat
+
+      # 产物应是带 PE 资源（版本信息 + 清单 + 图标）的 exe；
+      # 这里验证版本信息确实写入，rc 编译被跳过时立刻暴露。
+      - name: Verify PE version info
+        shell: pwsh
+        run: |
+          $exe = Resolve-Path release/hwbattery.exe
+          $vi = (Get-Item $exe).VersionInfo
+          Write-Host "FileDescription : $($vi.FileDescription)"
+          Write-Host "OriginalFilename: $($vi.OriginalFilename)"
+          if (-not $vi.FileDescription) { throw "VERSIONINFO 未写入，检查 windres 步骤" }
+          if ($vi.OriginalFilename -ne "hwbattery.exe") { throw "OriginalFilename 不符" }
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: hwbattery-exe
+          path: release/hwbattery.exe
+          if-no-files-found: error
+
+  release:
+    # 仅在推送 v* 标签时跑
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build
+        shell: cmd
+        run: src\build.bat
+
+      - name: Prepare asset
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item release/hwbattery.exe "dist/hwbattery-$tag.exe"
+          Get-ChildItem dist | Format-Table Name, Length
+
+      # 走 Gitea 自己的 REST API 建 Release 并上传附件。
+      # 注意：Gitea 的令牌变量名与 GitHub 不同——需在仓库设置里新建一个具写权限的
+      # 令牌，存成仓库 Secret 并命名为 GITEA_TOKEN（GitHub 那套 github.token 在这里
+      # 不适用）。
+      - name: Publish release
+        shell: pwsh
+        env:
+          TOKEN: ${{ secrets.GITEA_TOKEN }}
+        run: |
+          if (-not $env:TOKEN) { throw "缺少 secrets.GITEA_TOKEN，未配置则无法创建 Release" }
+
+          $tag  = "${{ github.ref_name }}"
+          $base = "${{ github.server_url }}"
+          $repo = "${{ github.repository }}"
+          $file = (Get-ChildItem dist/*.exe).FullName
+          $auth = @{ Authorization = "token $env:TOKEN" }
+
+          $rel = Invoke-RestMethod -Method Post `
+                   -Uri "$base/api/v1/repos/$repo/releases" -Headers $auth `
+                   -ContentType "application/json" `
+                   -Body (@{ tag_name = $tag; name = $tag; draft = $false } | ConvertTo-Json)
+
+          curl.exe -sS -X POST `
+            "$base/api/v1/repos/$repo/releases/$($rel.id)/assets?name=hwbattery-$tag.exe" `
+            -H "Authorization: token $env:TOKEN" `
+            -H "Content-Type: application/octet-stream" `
+            --data-binary "@$file"
