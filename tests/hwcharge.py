@@ -57,10 +57,14 @@ WMI_METHOD = "OemWMIfun"
 CMD_GET_THRESHOLD = 0x00001103  # \GBTT  Get Battery Threshold
 CMD_SET_THRESHOLD = 0x00001003  # \SBTT  Set Battery Threshold（固件模式下会被回滚，勿用）
 CMD_SET_SMART_MODE = 0x00001503  # 设置智能充电模式（本工具写阈值实际用的路径）
+CMD_GET_SMART_MODE = 0x00001603  # 读取智能充电模式与容量对
 
 # 写阈值时使用的智能充电模式号：固件 1/2/3/5/6 能忠实应用自定义阈值，
 # 4 号是固定档、恒为 40/70，不能用。
 SMART_MODE_CUSTOM = 1
+
+# 固件模式号有效范围（>= 7 视为无效读数）
+SMART_MODE_MAX = 6
 
 STATUS_OK = 0
 MAX_TRIES = 2  # 部分机型 BIOS 需要调用两次才执行
@@ -197,6 +201,45 @@ def battery_state():
     return None, None
 
 
+def read_charge_mode(instance):
+    """读取固件智能充电模式（0x1603）。
+
+    返回布局（来自 WmiUtil.dll @ 0x180005600 反汇编，**固定偏移**）：
+
+        out[1] = 模式号，有效范围 1..6（>= 7 视为无效）
+        out[2] = 该模式用固件预设表（0x48）还是自定义值（0）
+        out[3] = 容量对 [0]
+        out[4] = 容量对 [1]
+
+    返回 (mode, cap0, cap1, preset)；模式号越界时返回 (None, None, None, None)。
+
+    注意 cap0/cap1 是**固件侧的预设**，不等于实际生效阈值：
+    实际生效阈值一律以 0x1103 读到的 start/end 为准。
+    """
+    status, data = hwmi_call(instance, CMD_GET_SMART_MODE)
+    if status != STATUS_OK:
+        status, data = hwmi_call(instance, CMD_GET_SMART_MODE)
+    if status != STATUS_OK:
+        return None, None, None, None
+
+    mode = data[1]
+    if mode < 1 or mode > SMART_MODE_MAX:
+        return None, None, None, None
+    return mode, data[3], data[4], data[2] != 0
+
+
+def describe_mode(mode):
+    """模式号 -> 中文描述。"""
+    return {
+        1: "智能充电 65-70%",
+        2: "智能充电 85-90%",
+        3: "充满 95-100%",
+        4: "固件固定档",
+        5: "智能充电 65-70%",
+        6: "智能充电 65-70%",
+    }.get(mode, "未知")
+
+
 def describe(start, end):
     if start == 0 and end == 100:
         return "未启用（充满 100%）"
@@ -242,10 +285,20 @@ def main(argv=None):
         if not values:
             start, end = read_thresholds(instance)
             remaining, plugged = battery_state()
+            mode = cap0 = cap1 = None
+            mode_preset = None
+            try:
+                mode, cap0, cap1, mode_preset = read_charge_mode(instance)
+            except HwChargeError:
+                pass
             if args.json:
                 print(json.dumps({
                     "start": start, "end": end,
                     "mode": describe(start, end),
+                    "firmware_charge_mode": mode,
+                    "firmware_charge_mode_name": describe_mode(mode) if mode else None,
+                    "firmware_mode_is_preset": mode_preset,
+                    "capacity_pair": [cap0, cap1],
                     "charge_percent": remaining,
                     "plugged": plugged,
                 }, ensure_ascii=False))
@@ -255,6 +308,11 @@ def main(argv=None):
                     extra = f"（当前电量 {remaining}%，{'已插电' if plugged else '未插电'}）"
                 print(f"充电阈值: 起始 {start}%  结束 {end}%{extra}")
                 print(f"当前模式: {describe(start, end)}")
+                if mode is not None:
+                    kind = "预设" if mode_preset else "自定义"
+                    print(f"固件充电模式: {mode}（{describe_mode(mode)}）  {kind}  容量对 {cap0}/{cap1}")
+                else:
+                    print("固件充电模式: 读取失败")
             return 0
 
         if values[0] == "off":
