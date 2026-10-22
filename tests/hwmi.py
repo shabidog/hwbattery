@@ -17,15 +17,27 @@ HWMI 命令字，以及两个必须区分的读取路径。
 命令字总表（格式统一为 0xNN03，NN 为功能号，0x0e~0x18 连号）
 -------------------------------------------------------------
     0x0e03  SOC 电源控制条件          WmiUtil!GetSocPowerCtrlCondition
-    0x1003  设置充电阈值              WmiUtil!SetBatteryChargeThreshlod
+    0x1003  设置充电阈值              WmiUtil!SetBatteryChargeThreshlod（固件模式下会被回滚，勿用）
     0x1103  读取充电阈值              ← 不在任何 DLL 内（见下）
     0x1203  设置恢复充电标志          WmiUtil!SetResumeChargingFlag
     0x1303  读取恢复充电标志          WmiUtil!GetResumeChargingFlag
     0x1403  AC 供电时长               WmiUtil!GetAcDurationTime
-    0x1503  设置智能充电模式          WmiUtil!SetSmartChargeMode
+    0x1503  设置智能充电模式          WmiUtil!SetSmartChargeMode（写阈值实际走这条）
     0x1603  读取智能充电模式/容量     WmiUtil!GetSmartChargeMode
     0x1703  Prochot 原因              WmiUtil!GetProchotReason
     0x1803  温度控制策略              WmiUtil!SetTemperControlPolicy
+
+写阈值为什么用 0x1503 而不是 0x1003
+-----------------------------------
+固件开启「智能充电模式」后，0x1003 的写入会被固件丢弃，并在 0.2~1.3 秒内
+把阈值回滚到当前模式的预设值（典型表现：阈值被改回 0/100，即"充到 100%"）。
+
+这**不是**应用抢占，证据：
+  1. ETW 抓 Microsoft-Windows-WMI-Activity，回滚时刻前后没有任何 WMI 写入事件
+  2. 停掉华为 PCManager 服务、杀掉 HiviewService，回滚照旧发生
+  3. 回滚目标严格等于当前智能充电模式的预设值
+
+详见 docs/充电阈值被改回100%_排查.md。
 
 关于 0x1103 的重要更正
 ----------------------
@@ -71,6 +83,7 @@ SetBatteryChargeThreshlod；阈值写入实际经中间层包装：
 import argparse
 import json
 import sys
+import time
 
 try:
     import win32com.client as win32
@@ -99,6 +112,11 @@ CMD_SET_TEMPER_CTRL_POLICY = 0x1803
 STATUS_OK = 0
 MAX_TRIES = 2       # 部分机型 BIOS 需连续调用两次才执行
 SMART_MODE_MAX = 6  # 预设模式有效范围 1..6（7 是阈值表哨兵）
+
+# 写阈值时使用的智能充电模式号。
+# 固件的 1/2/3/5/6 号模式都能忠实应用「自定义」阈值对；4 号是固件固定档，
+# 忽略传入值、始终按 40/70 生效，所以不能用它。
+SMART_MODE_CUSTOM = 1
 
 # SmartChargeMode 预设阈值表（WmiUtil.dll @ dword_1800137A0，实测读出）
 # 布局: dword[2*mode-2] 低字节 = 起始%, dword[2*mode-1] 低字节 = 结束%
@@ -204,29 +222,46 @@ def read_threshold(instance):
     return start, end
 
 
-def set_threshold(instance, start, end, verify=True):
-    """用 0x1003 设置起止阈值。
+def set_threshold(instance, start, end, verify=True, mode=SMART_MODE_CUSTOM):
+    """用 0x1503（SetSmartChargeMode）设置起止阈值。
 
-    载荷（来自 WmiUtil.dll @ 0x180003110 反汇编）：
+    载荷（来自 WmiUtil.dll @ 0x180005430 反汇编）::
 
-        bytes[0..1] = 0x1003 (LE)
-        bytes[2]    = start
-        bytes[3]    = end
+        bytes[0..1] = 0x1503 (LE)
+        bytes[2]    = mode
+        bytes[3]    = 0        <- 置 0 表示"用我传入的起止值"；置非 0 走固件预设表
+        bytes[4]    = start
+        bytes[5]    = end
 
-    与 HardwareHal!Battery::SetChargeThreshold 传入的 2 字节打包结构
-    { BYTE start; BYTE end; } 一一对应（低字节 start、高字节 end）。
+    为什么不用 0x1003（CMD_SET_THRESHOLD）：
+        固件开启「智能充电模式」后，0x1003 的写入会被固件丢弃，并在 0.2~1.3 秒内
+        把阈值回滚到当前模式的预设值（典型表现：阈值被改回 0/100，即"充到 100%"）。
+        这不是应用抢占——停掉华为 PCManager 服务、杀掉 HiviewService 后回滚照旧发生，
+        且回滚时刻前后没有任何 WMI 写入事件。
+        详见 docs/充电阈值被改回100%_排查.md。
+
+    mode 取 1：固件的 1/2/3/5/6 号模式都能忠实应用自定义阈值；
+    4 号是固件固定档，无论传什么都固定成 40/70。
     """
     if not (0 <= start <= 100 and 0 <= end <= 100):
         raise HwmiError(f"阈值必须是 0-100，收到 start={start} end={end}")
     if start > end:
         raise HwmiError(f"起始阈值不能大于结束阈值（{start} > {end}）")
+    if not (1 <= mode <= SMART_MODE_MAX):
+        raise HwmiError(f"模式号必须在 1..{SMART_MODE_MAX}，收到 {mode}")
 
-    payload = CMD_SET_THRESHOLD.to_bytes(2, "little") + bytes([start, end]) + bytes(4)
+    payload = (
+        CMD_SET_SMART_CHARGE_MODE.to_bytes(2, "little")
+        + bytes([mode & 0xFF, 0, start & 0xFF, end & 0xFF])
+        + bytes(2)
+    )
     status, _ = hwmi_exec(instance, payload)
     if status != STATUS_OK:
         raise HwmiError(f"设置阈值失败，BIOS 返回状态 0x{status:02X}")
 
     if verify:
+        # 固件落盘不是瞬时的，稍等再回读
+        time.sleep(0.3)
         cur_start, cur_end = read_threshold(instance)
         if (cur_start, cur_end) != (start, end):
             raise HwmiError(
