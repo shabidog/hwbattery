@@ -52,7 +52,10 @@
 #define WM_TRAYMSG     (WM_APP + 1)
 #define ID_TRAY        1
 #define ID_TIMER       1001
+#define ID_TRAY_RETRY  1002      /* 托盘图标重试定时器 */
 #define REFRESH_MS     15000    /* 刷新间隔：启动时先读一次，之后按此周期更新 */
+#define TRAY_RETRY_MS  3000     /* 托盘重试间隔：3 秒 */
+#define TRAY_RETRY_MAX 40       /* 最多重试 40 次（约 2 分钟） */
 
 /* 菜单命令 ID */
 #define IDM_REFRESH    100
@@ -97,6 +100,17 @@ typedef struct {
     BOOL  threshold_valid;
     int   th_start;
     int   th_end;
+
+    /* 固件智能充电模式（来自 0x1603，读失败时 mode_valid=FALSE）
+     * mode     固件模式号 1..6
+     * cap0/cap1 该模式对应的容量对（固件侧的预设值）
+     * preset   该模式是否用固件预设表（out[2] 非 0 为预设，0 为自定义）
+     * 注意：cap0/cap1 只是固件的"模式预设"，实际生效阈值以 th_start/th_end 为准。 */
+    BOOL  mode_valid;
+    int   mode;
+    int   cap0;
+    int   cap1;
+    BOOL  mode_preset;
 } BatteryState;
 
 /* 读一个电池设备接口路径，填充 state。返回是否成功。 */
@@ -214,6 +228,7 @@ static BOOL battery_read(BatteryState *st)
 #define CMD_GET_THRESHOLD   0x1103ULL   /* \GBTT 读取阈值（固件提供，不在 DLL 内） */
 #define CMD_SET_THRESHOLD   0x1003ULL   /* \SBTT 设置阈值（固件模式下会被回滚，勿用） */
 #define CMD_SET_SMART_MODE  0x1503ULL   /* 设置智能充电模式（本程序写阈值实际用的路径） */
+#define CMD_GET_SMART_MODE  0x1603ULL   /* 读取智能充电模式与容量对 */
 
 /* 写阈值时使用的智能充电模式号。
  *
@@ -221,6 +236,9 @@ static BOOL battery_read(BatteryState *st)
  * 4 号是固件的固定档，忽略传入值、始终按 40/70 生效，所以不能用它。
  * 详见 docs/充电阈值被改回100%_排查.md。 */
 #define SMART_MODE_CUSTOM  1
+
+/* 固件智能充电模式号上限（>= 7 视为无效读数） */
+#define SMART_MODE_MAX     6
 
 static BOOL g_com_ready = FALSE;
 static IWbemServices *g_svc = NULL;
@@ -435,6 +453,35 @@ static BOOL hwmi_read_threshold(int *start, int *end)
     return TRUE;
 }
 
+/* 读取固件智能充电模式（0x1603）。
+ *
+ * 返回布局（来自 WmiUtil.dll @ 0x180005600 反汇编，**固定偏移**）：
+ *     out[1] = 模式号，有效范围 1..6（>= 7 视为无效读数）
+ *     out[2] = 该模式用的是预设表还是自定义值（非 0 = 预设，0 = 自定义）
+ *     out[3] = 容量对 [0]（该模式的预设起始%）
+ *     out[4] = 容量对 [1]（该模式的预设截止%）
+ *
+ * 注意 out[3]/out[4] 是**固件侧的预设**，不等于实际生效阈值：
+ * 实测固件 mode 4 会报 65/70，但 0x1103 读回的实际生效值是 40/70；
+ * 而走固件预设表的 mode 4 读回的是 0/100（"充满"）。
+ * 实际生效阈值一律以 0x1103 为准。 */
+static BOOL hwmi_read_mode(int *mode, int *cap0, int *cap1, BOOL *preset)
+{
+    BYTE out[256] = {0}, status = 0;
+    if (!hwmi_call_retry(CMD_GET_SMART_MODE, out, &status) || status != 0)
+        return FALSE;
+
+    int m = out[1];
+    if (m < 1 || m > SMART_MODE_MAX)
+        return FALSE;                       /* 无效读数 */
+
+    *mode   = m;
+    *cap0   = out[3];
+    *cap1   = out[4];
+    *preset = (out[2] != 0);
+    return TRUE;
+}
+
 /* 设置起止阈值（0x1503 SetSmartChargeMode）。
  *
  * 载荷布局（来自 WmiUtil.dll!SetSmartChargeMode 反汇编）：
@@ -486,7 +533,16 @@ static BatteryState    g_state;
 static NOTIFYICONDATAW g_nid;
 static BOOL            g_autostart = FALSE;
 
+/* 托盘图标状态。
+ * 开机自启时任务会在用户登录、但 Explorer 尚未启动的时刻被拉起，此时
+ * 托盘区域还不存在，Shell_NotifyIcon 必然失败。程序不能因此退出——
+ * 阈值下发是它在登录时最该做的事。所以改成"失败就退避重试"。 */
+static BOOL            g_tray_added = FALSE;   /* 托盘图标是否已成功添加 */
+static int             g_tray_tries  = 0;      /* 已重试次数 */
+
 static void refresh_state(void);
+static void cli_log(const wchar_t *msg);  /* 定义见后文 */
+static BOOL tray_add(HWND hwnd);          /* 定义见后文 */
 static void cfg_show(void);      /* 设置窗口，定义见后文 */
 static void cfg_refresh(HWND h); /* 设置窗口内的数值刷新，定义见后文 */
 static HWND g_cfg = NULL;        /* 设置窗口句柄，由 cfg_show 创建 */
@@ -687,6 +743,43 @@ static BOOL autostart_set(BOOL on)
 
 /* ---------------------------------------------------------------- 托盘显示 */
 
+/* 固件智能充电模式的中文描述。
+ *
+ * 模式号语义（PCManager 的 SmartChargePlugin 与 WmiUtil 的 MODE_PRESETS 表）：
+ *     1 = 智能充电（65%/70%）
+ *     2 = 智能充电（85%/90%）
+ *     3 = 充满（95%/100%）
+ *     4 = 固件固定档
+ *     5 = 智能充电（65%/70%）
+ *     6 = 智能充电（65%/70%）
+ *
+ * 模式 4 是特例：无论传什么阈值它都固定生效 40/70；走固件预设表时
+ * 0x1103 读回 0/100（"充满"），这正是 0x1003 写入失败后固件回滚到的目标。
+ * 详见 docs/充电阈值被改回100%_排查.md。
+ *
+ * 名字取的是**该模式在固件预设表里的档位名**。当前若是自定义阈值
+ * （out[2] == 0），调用方应改用"自定义"字样，否则会出现
+ * "自定义 65-90%" 却挂着 "智能充电 65-70%" 这种自相矛盾的描述。
+ */
+static const wchar_t *mode_name(int mode)
+{
+    switch (mode) {
+    case 1: return L"智能充电 65-70%";
+    case 2: return L"智能充电 85-90%";
+    case 3: return L"充满 95-100%";
+    case 4: return L"固件固定档";
+    case 5:
+    case 6: return L"智能充电 65-70%";
+    default: return L"未知";
+    }
+}
+
+/* 模式 + 是否预设 -> 完整描述。自定义时用"自定义"而不是预设档位名。 */
+static const wchar_t *mode_desc(int mode, BOOL preset)
+{
+    return preset ? mode_name(mode) : L"自定义";
+}
+
 static void update_tooltip(void)
 {
     wchar_t tip[128];
@@ -699,6 +792,12 @@ static void update_tooltip(void)
     } else {
         swprintf(tip, 128, L"电量 %d%%  健康 %d%%  阈值不可用",
                  g_state.percent, g_state.health);
+    }
+
+    if (g_state.mode_valid) {
+        wchar_t mode[48];
+        swprintf(mode, 48, L"  模式 %d", g_state.mode);
+        wcsncat(tip, mode, 127 - wcslen(tip));
     }
 
     wcsncpy(g_nid.szTip, tip, 127);
@@ -717,6 +816,18 @@ static void refresh_state(void)
         g_state.threshold_valid = TRUE;
     } else {
         g_state.threshold_valid = FALSE;
+    }
+
+    int mode = 0, cap0 = 0, cap1 = 0;
+    BOOL preset = FALSE;
+    if (hwmi_read_mode(&mode, &cap0, &cap1, &preset)) {
+        g_state.mode = mode;
+        g_state.cap0 = cap0;
+        g_state.cap1 = cap1;
+        g_state.mode_preset = preset;
+        g_state.mode_valid = TRUE;
+    } else {
+        g_state.mode_valid = FALSE;
     }
 
     update_tooltip();
@@ -741,6 +852,16 @@ static void show_menu(HWND hwnd)
         swprintf(line, 160, L"设计 %lu / 满充 %lu mWh",
                  (unsigned long)g_state.designed, (unsigned long)g_state.full_charged);
         AppendMenuW(m, MF_STRING | MF_DISABLED, 0, line);
+
+        /* 固件当前的智能充电模式。阈值与模式是两回事：模式是固件的档位，
+         * 阈值是实际生效的百分比。 */
+        if (g_state.mode_valid) {
+            swprintf(line, 160, L"固件模式 %d：%s", g_state.mode,
+                     mode_desc(g_state.mode, g_state.mode_preset));
+            AppendMenuW(m, MF_STRING | MF_DISABLED, 0, line);
+        } else {
+            AppendMenuW(m, MF_STRING | MF_DISABLED, 0, L"固件模式：读取失败");
+        }
     } else {
         AppendMenuW(m, MF_STRING | MF_DISABLED, 0, L"未检测到电池");
     }
@@ -889,12 +1010,26 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
              * 两处刷新节奏天然一致；窗口没开时这里几乎零开销。 */
             if (g_cfg && IsWindowVisible(g_cfg))
                 cfg_refresh(g_cfg);
+        } else if (wp == ID_TRAY_RETRY) {
+            /* 托盘还没建起来（多半是 Explorer 尚未启动），继续等。
+             * 重建成功就停掉这个重试定时器。 */
+            if (tray_add(hwnd)) {
+                KillTimer(hwnd, ID_TRAY_RETRY);
+            } else if (++g_tray_tries >= TRAY_RETRY_MAX) {
+                /* 重试到上限仍失败：Explorer 一直没起来。放弃托盘但**不退出**——
+                 * 阈值已经下发过了，进程留着，等下次手动启动或用户再登录时
+                 * 还能补上。写日志留个痕迹。 */
+                KillTimer(hwnd, ID_TRAY_RETRY);
+                cli_log(L"[!] 托盘图标多次添加失败，已放弃托盘（进程继续运行）");
+            }
         }
         return 0;
 
     case WM_DESTROY:
-        Shell_NotifyIconW(NIM_DELETE, &g_nid);
+        if (g_tray_added)
+            Shell_NotifyIconW(NIM_DELETE, &g_nid);
         KillTimer(hwnd, ID_TIMER);
+        KillTimer(hwnd, ID_TRAY_RETRY);
         PostQuitMessage(0);
         return 0;
     }
@@ -1025,6 +1160,20 @@ static void cfg_refresh(HWND h)
                  g_state.th_start, g_state.th_end);
     } else {
         wcscpy(buf, L"BIOS 当前阈值：读取失败或本机未开放 HWMI");
+    }
+    {
+        wchar_t extra[160];
+        if (g_state.mode_valid) {
+            /* 容量对是固件侧的预设值，实际生效阈值看上面那行。 */
+            swprintf(extra, 160,
+                     L"\r\n固件充电模式：%d（%s）%s %d-%d%%",
+                     g_state.mode, mode_desc(g_state.mode, g_state.mode_preset),
+                     g_state.mode_preset ? L"  预设" : L"  自定义",
+                     g_state.cap0, g_state.cap1);
+        } else {
+            wcscpy(extra, L"\r\n固件充电模式：读取失败");
+        }
+        wcsncat(buf, extra, 1023 - wcslen(buf));
     }
     {
         wchar_t extra[160];
@@ -1325,7 +1474,7 @@ static int cli_autostart(const wchar_t *value)
  * 走的是和设置窗口完全相同的数据路径，因此也可用来验证 GUI 显示是否正常。 */
 static int cli_query(void)
 {
-    wchar_t th[32], msg[512];
+    wchar_t th[32], md[64], msg[640];
 
     refresh_state();
 
@@ -1334,14 +1483,20 @@ static int cli_query(void)
     else
         wcscpy(th, L"读取失败");
 
+    if (g_state.mode_valid)
+        swprintf(md, 64, L"模式 %d（%s）", g_state.mode,
+                 mode_desc(g_state.mode, g_state.mode_preset));
+    else
+        wcscpy(md, L"模式 读取失败");
+
     if (g_state.ok) {
-        swprintf(msg, 512,
+        swprintf(msg, 640,
                  L"电量 %d%%  健康 %d%%  设计 %lu / 满充 %lu mWh  "
-                 L"循环 %lu  阈值 %s  DPI %d",
+                 L"循环 %lu  阈值 %s  %s  DPI %d",
                  g_state.percent, g_state.health,
                  (unsigned long)g_state.designed,
                  (unsigned long)g_state.full_charged,
-                 (unsigned long)g_state.cycle_count, th, g_dpi);
+                 (unsigned long)g_state.cycle_count, th, md, g_dpi);
     } else {
         wcscpy(msg, L"[!] 未检测到电池设备");
     }
@@ -1372,6 +1527,33 @@ static HICON app_icon(int cx, int cy)
     if (!ic)
         ic = LoadIconW(NULL, IDI_APPLICATION);
     return ic;
+}
+
+/* 添加托盘图标。成功返回 TRUE。
+ *
+ * 开机自启时，任务计划程序会在用户登录、但 Explorer 尚未启动的时刻把本进程
+ * 拉起来——此时托盘区域还不存在，Shell_NotifyIcon 必然失败。旧实现在这里
+ * 弹个错误框然后退出，于是用户刚登录就看到"添加托盘图标失败"、程序也没了。
+ *
+ * 现在改成：失败不退出，返回 FALSE 由调用方启动重试定时器，等 Explorer
+ * 就绪后再补上图标。阈值下发照常进行，不受托盘影响。 */
+static BOOL tray_add(HWND hwnd)
+{
+    ZeroMemory(&g_nid, sizeof(g_nid));
+    g_nid.cbSize = sizeof(g_nid);
+    g_nid.hWnd = hwnd;
+    g_nid.uID = ID_TRAY;
+    g_nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+    g_nid.uCallbackMessage = WM_TRAYMSG;
+    g_nid.hIcon = app_icon(GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON));
+    wcsncpy(g_nid.szTip, APP_TITLE, 127);
+    g_nid.szTip[127] = L'\0';
+
+    if (!Shell_NotifyIconW(NIM_ADD, &g_nid))
+        return FALSE;
+
+    g_tray_added = TRUE;
+    return TRUE;
 }
 
 int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int nShow)
@@ -1443,17 +1625,12 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int nShow)
     if (!hwnd)
         return 1;
 
-    ZeroMemory(&g_nid, sizeof(g_nid));
-    g_nid.cbSize = sizeof(g_nid);
-    g_nid.hWnd = hwnd;
-    g_nid.uID = ID_TRAY;
-    g_nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
-    g_nid.uCallbackMessage = WM_TRAYMSG;
-    g_nid.hIcon = app_icon(GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON));
-    wcsncpy(g_nid.szTip, APP_TITLE, 127);
-    if (!Shell_NotifyIconW(NIM_ADD, &g_nid)) {
-        MessageBoxW(NULL, L"添加托盘图标失败。", APP_TITLE, MB_ICONERROR);
-        return 1;
+    /* 托盘图标。开机自启时 Explorer 可能还没启动，这时托盘不存在、
+     * Shell_NotifyIcon 必然失败——不能因此退出，否则用户刚登录就看到
+     * "添加托盘图标失败"、程序也没了。改成退避重试，等 Explorer 就绪再补上。 */
+    if (!tray_add(hwnd)) {
+        g_tray_tries = 1;
+        SetTimer(hwnd, ID_TRAY_RETRY, TRAY_RETRY_MS, NULL);
     }
 
     /* 读配置并把"期望阈值"下发一次。失败只写日志、不弹窗——

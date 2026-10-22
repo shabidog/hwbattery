@@ -279,10 +279,16 @@ def get_smart_charge_mode(instance):
     返回布局（来自 WmiUtil.dll @ 0x180005600 反汇编，**固定偏移**）：
 
         out[1] = 模式，有效范围 1..6（>= 7 视为无效）
+        out[2] = 该模式用固件预设表（0x48）还是自定义值（0）
         out[3] = 容量[0]
         out[4] = 容量[1]
 
-    返回 (mode, cap0, cap1)；模式号越界时整体返回 (None, None, None)。
+    返回 (mode, cap0, cap1, preset)；模式号越界时返回 (None, None, None, None)。
+
+    注意 cap0/cap1 是**固件侧的预设**，不等于实际生效阈值：
+    实测 mode 4 报 65/70，但 0x1103 读回的实际生效值是 40/70；
+    而走固件预设表的 mode 4 读回 0/100（"充满"）。
+    实际生效阈值一律以 0x1103 为准。
     """
     status, data = hwmi_exec(instance, CMD_GET_SMART_CHARGE_MODE)
     if status != STATUS_OK:
@@ -290,8 +296,25 @@ def get_smart_charge_mode(instance):
 
     mode = data[1]
     if mode >= 7:
-        return None, None, None
-    return mode, data[3], data[4]
+        return None, None, None, None
+    return mode, data[3], data[4], data[2] != 0
+
+
+# 固件智能充电模式号的中文含义
+# （PCManager 的 SmartChargePlugin 与 WmiUtil 的 MODE_PRESETS 表）
+MODE_NAMES = {
+    1: "智能充电 65-70%",
+    2: "智能充电 85-90%",
+    3: "充满 95-100%",
+    4: "固件固定档",
+    5: "智能充电 65-70%",
+    6: "智能充电 65-70%",
+}
+
+
+def mode_name(mode):
+    """模式号 -> 中文描述。"""
+    return MODE_NAMES.get(mode, "未知")
 
 
 def set_smart_charge_mode(instance, mode, start=None, end=None, preset=True, a3=0):
@@ -428,8 +451,9 @@ def _print_status(instance, as_json):
     start, end = read_threshold(instance)
 
     mode = cap0 = cap1 = None
+    mode_preset = None
     try:
-        mode, cap0, cap1 = get_smart_charge_mode(instance)
+        mode, cap0, cap1, mode_preset = get_smart_charge_mode(instance)
     except HwmiError:
         pass
 
@@ -446,6 +470,8 @@ def _print_status(instance, as_json):
             "threshold_end": end,
             "threshold_desc": describe(start, end),
             "smart_mode": mode,
+            "smart_mode_name": mode_name(mode) if mode is not None else None,
+            "smart_mode_is_preset": mode_preset,
             "capacity_pair": [cap0, cap1],
             "mode_preset": list(MODE_PRESETS.get(mode)) if mode in MODE_PRESETS else None,
             "resume_charging_flag": resume,
@@ -457,9 +483,11 @@ def _print_status(instance, as_json):
     print(f"充电阈值    : 起始 {start}%  结束 {end}%")
     print(f"当前模式    : {describe(start, end)}")
     if mode is not None:
-        preset = MODE_PRESETS.get(mode)
-        extra = f"预设 {preset[0]}%-{preset[1]}%" if preset else "无预设"
-        print(f"智能充电模式: {mode}（{extra}）  out[3]/out[4] = {cap0}/{cap1}")
+        kind = "预设" if mode_preset else "自定义"
+        print(f"固件充电模式: {mode}（{mode_name(mode)}）  {kind}  容量对 {cap0}/{cap1}")
+        print(f"              注：容量对是固件侧预设，实际生效阈值以「充电阈值」行为准")
+    else:
+        print("固件充电模式: 读取失败")
     if resume is not None:
         print(f"恢复充电标志: {'已置位' if resume else '未置位'}")
     if info["charge_percent"] is not None:

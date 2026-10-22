@@ -30,11 +30,12 @@
 - `hwmi_drop_cache`(308) —— 丢弃上述缓存，仅在后续调用失败时使用
 - `hwmi_call`(320) —— 下发一个命令字，回填 256 字节返回区与状态码
 - `hwmi_call_retry`(395) —— 部分机型需连发两次才执行，统一封装重试
-- `hwmi_read_threshold`(407) / `hwmi_set_threshold`(426) —— 读 / 写充电阈值
+- `hwmi_read_threshold`(407) / `hwmi_read_mode`(450) / `hwmi_set_threshold`(485) —— 读阈值 / 读固件充电模式 / 写充电阈值
   - 写走 `0x1503`（SetSmartChargeMode，模式 1 + 自定义起止值），不写 `0x1003`：
     固件智能充电模式下 `0x1003` 的写入会被回滚，详见
     [docs/充电阈值被改回100%_排查.md](../docs/充电阈值被改回100%_排查.md)
   - 写完回读 `0x1103` 校验实际生效值，不只看返回状态
+  - `0x1603` 的容量对只是固件侧预设，实际生效阈值一律以 `0x1103` 为准
 
 ### 配置文件（476–561）
 - `cfg_ini_path`(476) —— 取 exe 同目录下 `hwbattery.ini` 的完整路径
