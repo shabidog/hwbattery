@@ -82,7 +82,7 @@ WinMain
  ├─ cfg_load()            读 ini；不存在则生成默认 65/90
  ├─ hwmi_set_threshold()  把期望阈值下发给固件（失败只记日志，不弹窗）
  ├─ refresh_state()       先读一次
- └─ SetTimer(15 秒)       之后每次触发 refresh_state()，窗口可见时一并刷新
+ └─ SetTimer(1 分钟)       之后每次触发 refresh_state()，窗口可见时一并刷新
 ```
 
 ## 设计要点

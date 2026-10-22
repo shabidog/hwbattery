@@ -53,7 +53,7 @@
 #define ID_TRAY        1
 #define ID_TIMER       1001
 #define ID_TRAY_RETRY  1002      /* 托盘图标重试定时器 */
-#define REFRESH_MS     15000    /* 刷新间隔：启动时先读一次，之后按此周期更新 */
+#define REFRESH_MS     60000    /* 刷新间隔：启动时先读一次，之后按此周期更新 */
 #define TRAY_RETRY_MS  60000    /* 托盘重试间隔：1 分钟 */
 #define TRAY_RETRY_MAX 60       /* 最多重试 60 次（约 1 小时） */
 
