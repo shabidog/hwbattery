@@ -13,10 +13,17 @@ u64Input 是一个 64 位命令字，返回缓冲区 u8Output 共 256 字节，
 首字节为状态（0 = 成功），其后是数据。充电阈值相关命令：
 
     读取: 0x00001103            -> out[1] = 起始阈值(%), out[2] = 结束阈值(%)
-    设置: 0x00001003 | 起<<16 | 止<<24   （即字节 [0..1]=0x1003,[2]=起,[3]=止）
+    设置: 0x00001503 | 模式<<16 | 0<<24 | 起<<32 | 止<<40
+          （即字节 [0..1]=0x1503, [2]=模式, [3]=0, [4]=起, [5]=止）
 
 这些命令字是从 PCManager 的 WmiUtil.dll（HwSDK::BiosWmi::*）反汇编取出，
 与 Linux 主线驱动 drivers/platform/x86/huawei-wmi.c 的 HWMI 协议一致。
+
+注意：写阈值用 0x1503 而不是更常见的 0x1003。固件开启「智能充电模式」后，
+0x1003 的写入会被固件丢弃，并在 0.2~1.3 秒内把阈值回滚到当前模式的预设值
+（典型表现：阈值被改回 0/100，即"充到 100%"）。这**不是**应用抢占——
+停掉华为 PCManager 服务、杀掉 HiviewService 后回滚照旧发生，且回滚时刻
+前后没有任何 WMI 写入事件。详见 docs/充电阈值被改回100%_排查.md。
 
 注意：部分机型的 BIOS 需要连续调用两次才会真正执行/生效，本工具已内置该重试。
 
@@ -35,6 +42,7 @@ u64Input 是一个 64 位命令字，返回缓冲区 u8Output 共 256 字节，
 import argparse
 import json
 import sys
+import time
 
 try:
     import win32com.client as win32
@@ -47,7 +55,12 @@ WMI_CLASS = "OemWMIMethod"
 WMI_METHOD = "OemWMIfun"
 
 CMD_GET_THRESHOLD = 0x00001103  # \GBTT  Get Battery Threshold
-CMD_SET_THRESHOLD = 0x00001003  # \SBTT  Set Battery Threshold
+CMD_SET_THRESHOLD = 0x00001003  # \SBTT  Set Battery Threshold（固件模式下会被回滚，勿用）
+CMD_SET_SMART_MODE = 0x00001503  # 设置智能充电模式（本工具写阈值实际用的路径）
+
+# 写阈值时使用的智能充电模式号：固件 1/2/3/5/6 能忠实应用自定义阈值，
+# 4 号是固定档、恒为 40/70，不能用。
+SMART_MODE_CUSTOM = 1
 
 STATUS_OK = 0
 MAX_TRIES = 2  # 部分机型 BIOS 需要调用两次才执行
@@ -118,15 +131,35 @@ def read_thresholds(instance):
 
 
 def set_thresholds(instance, start, end, verify=True):
-    """设置起止阈值。"""
+    """设置起止阈值（走 0x1503 SetSmartChargeMode）。
+
+    载荷（来自 WmiUtil.dll @ 0x180005430 反汇编）::
+
+        bytes[0..1] = 0x1503 (LE)
+        bytes[2]    = 模式号
+        bytes[3]    = 0        <- 置 0 表示"用我传入的起止值"；置非 0 走固件预设表
+        bytes[4]    = start
+        bytes[5]    = end
+
+    为什么不用 0x1003（SetBatteryChargeThreshlod）：
+        固件开启「智能充电模式」后，0x1003 的写入会被固件丢弃，并在 0.2~1.3 秒内
+        把阈值回滚到当前模式的预设值（典型表现：阈值被改回 0/100，即"充到 100%"）。
+        这不是应用抢占——停掉华为 PCManager 服务、杀掉 HiviewService 后回滚照旧发生。
+        详见 docs/充电阈值被改回100%_排查.md。
+
+    模式取 1：固件 1/2/3/5/6 号模式能忠实应用自定义阈值；4 号是固定档、恒为 40/70。
+    """
     if not (0 <= start <= 100 and 0 <= end <= 100):
         raise HwChargeError(f"阈值必须是 0-100，收到 start={start} end={end}")
     if start > end:
         raise HwChargeError(f"起始阈值不能大于结束阈值（{start} > {end}）")
 
-    # 字节布局（来自 WmiUtil.dll @ 0x180003110 反汇编）：
-    #   bytes[0..1] = 0x1003 (LE), bytes[2] = start, bytes[3] = end
-    cmd = CMD_SET_THRESHOLD | (start << 16) | (end << 24)
+    cmd = (
+        CMD_SET_SMART_MODE
+        | (SMART_MODE_CUSTOM << 16)
+        | (start << 32)
+        | (end << 40)
+    )
 
     status, data = hwmi_call(instance, cmd)
     if status != STATUS_OK:  # 二次调用
@@ -135,6 +168,8 @@ def set_thresholds(instance, start, end, verify=True):
         raise HwChargeError(f"设置阈值失败，BIOS 返回状态 0x{status:02X}")
 
     if verify:
+        # 固件落盘不是瞬时的，稍等再回读
+        time.sleep(0.3)
         cur_start, cur_end = read_thresholds(instance)
         if (cur_start, cur_end) != (start, end):
             raise HwChargeError(
