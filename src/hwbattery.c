@@ -10,9 +10,14 @@
  *                     本机 WMI 的 Win32_Battery 返回 DesignCapacity /
  *                     FullChargeCapacity 均为空，所以必须直接问电池驱动。
  *   充电阈值        : ACPI-WMI  root\\WMI\\OemWMIMethod::OemWMIfun
- *                     命令字 0x1003，字节布局 [0..1]=0x1003 [2]=起始% [3]=结束%
- *                     （由 PCManager 的 WmiUtil.dll!SetBatteryChargeThreshlod
- *                       与 HardwareHal.dll!Battery::SetChargeThreshold 反汇编得到）
+ *                     读：命令字 0x1103（固件提供，Linux huawei-wmi 同源）
+ *                     写：命令字 0x1503 SetSmartChargeMode，字节布局
+ *                       [0..1]=0x1503 [2]=模式 [3]=0 [4]=起始% [5]=结束%
+ *                     为什么不写 0x1003（SetBatteryChargeThreshlod）：
+ *                     固件开启「智能充电模式」后，0x1003 的写入会被固件在
+ *                     0.2~1.3 秒内丢弃并回滚到当前模式的预设值（典型表现：
+ *                     阈值被改回 0/100 即「充电到 100%」）。改用 0x1503
+ *                     走模式化写入，固件会忠实应用给定阈值。详见 docs/。
  *
  * 编译（mingw-w64 gcc，见同目录 build.bat）
  *   gcc -O2 -o hwbattery.exe hwbattery.c \
@@ -207,7 +212,15 @@ static BOOL battery_read(BatteryState *st)
  */
 
 #define CMD_GET_THRESHOLD   0x1103ULL   /* \GBTT 读取阈值（固件提供，不在 DLL 内） */
-#define CMD_SET_THRESHOLD   0x1003ULL   /* \SBTT 设置阈值                         */
+#define CMD_SET_THRESHOLD   0x1003ULL   /* \SBTT 设置阈值（固件模式下会被回滚，勿用） */
+#define CMD_SET_SMART_MODE  0x1503ULL   /* 设置智能充电模式（本程序写阈值实际用的路径） */
+
+/* 写阈值时使用的智能充电模式号。
+ *
+ * 固件的 1~6 号模式里，1/2/3/5/6 都能忠实应用「自定义」阈值对；
+ * 4 号是固件的固定档，忽略传入值、始终按 40/70 生效，所以不能用它。
+ * 详见 docs/充电阈值被改回100%_排查.md。 */
+#define SMART_MODE_CUSTOM  1
 
 static BOOL g_com_ready = FALSE;
 static IWbemServices *g_svc = NULL;
@@ -422,20 +435,46 @@ static BOOL hwmi_read_threshold(int *start, int *end)
     return TRUE;
 }
 
-/* 设置起止阈值（0x1003）。字节布局 [0..1]=0x1003 [2]=起始 [3]=结束 */
+/* 设置起止阈值（0x1503 SetSmartChargeMode）。
+ *
+ * 载荷布局（来自 WmiUtil.dll!SetSmartChargeMode 反汇编）：
+ *     [0..1] = 0x1503 (LE)
+ *     [2]    = 模式号
+ *     [3]    = 0 —— 置 0 表示「用我传入的起止值」，置非 0 则走固件预设表
+ *     [4]    = 起始%
+ *     [5]    = 结束%
+ *
+ * 为什么不用 0x1003（CMD_SET_THRESHOLD）：
+ * 固件启用智能充电模式后，0x1003 的写入会被固件丢弃，并在 0.2~1.3 秒内
+ * 回滚到当前模式的预设阈值（常见回滚目标是 0/100，即"充到 100%"）。
+ * 实测无论是否停掉华为 PCManager 服务 / 杀掉 HiviewService，回滚都照旧，
+ * 说明这是固件行为而非应用抢占。详见 docs/充电阈值被改回100%_排查.md。
+ *
+ * 写完回读一次：0x1003 时代"返回 0 即成功"并不代表阈值真的生效，
+ * 这里必须以 0x1103 的回读值为准。 */
 static BOOL hwmi_set_threshold(int start, int end)
 {
     if (start < 0 || start > 100 || end < 0 || end > 100 || start > end)
         return FALSE;
 
-    unsigned long long cmd = CMD_SET_THRESHOLD
-                           | ((unsigned long long)(start & 0xFF) << 16)
-                           | ((unsigned long long)(end & 0xFF) << 24);
+    unsigned long long cmd = CMD_SET_SMART_MODE
+                           | ((unsigned long long)(SMART_MODE_CUSTOM & 0xFF) << 16)
+                           | ((unsigned long long)(start & 0xFF) << 32)
+                           | ((unsigned long long)(end & 0xFF) << 40);
 
     BYTE out[256] = {0}, status = 0;
-    if (!hwmi_call_retry(cmd, out, &status))
+    if (!hwmi_call_retry(cmd, out, &status) || status != 0)
         return FALSE;
-    return status == 0;
+
+    /* 回读校验：固件可能对某些组合做归一化（如 start==0 时回读形态不同），
+     * 这里只在回读明确有值且与请求不符时判失败。
+     * 固件落盘不是瞬时的，先给它一点时间再回读。 */
+    Sleep(300);
+    int rs = 0, re = 0;
+    if (hwmi_read_threshold(&rs, &re))
+        return (rs == start && re == end);
+
+    return TRUE;
 }
 
 /* ---------------------------------------------------------------- 全局状态 */
