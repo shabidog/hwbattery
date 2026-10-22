@@ -1,7 +1,8 @@
 # src —— 正式代码
 
 纯 Win32 / 纯 C，无第三方运行库依赖，单文件实现。产品说明见仓库根 [README.md](../README.md)；
-开发期验证脚本见 [tests/](../tests/README.md)。
+开发期验证脚本见 [tests/](../tests/README.md)；
+排查记录见 [docs/](../docs/)。
 
 ## 文件
 
@@ -30,6 +31,10 @@
 - `hwmi_call`(320) —— 下发一个命令字，回填 256 字节返回区与状态码
 - `hwmi_call_retry`(395) —— 部分机型需连发两次才执行，统一封装重试
 - `hwmi_read_threshold`(407) / `hwmi_set_threshold`(426) —— 读 / 写充电阈值
+  - 写走 `0x1503`（SetSmartChargeMode，模式 1 + 自定义起止值），不写 `0x1003`：
+    固件智能充电模式下 `0x1003` 的写入会被回滚，详见
+    [docs/充电阈值被改回100%_排查.md](../docs/充电阈值被改回100%_排查.md)
+  - 写完回读 `0x1103` 校验实际生效值，不只看返回状态
 
 ### 配置文件（476–561）
 - `cfg_ini_path`(476) —— 取 exe 同目录下 `hwbattery.ini` 的完整路径
