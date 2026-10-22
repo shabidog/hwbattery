@@ -22,8 +22,8 @@
 1 ICON "hwbattery.ico"
 
 VS_VERSION_INFO VERSIONINFO
- FILEVERSION     1,0,0,0
- PRODUCTVERSION  1,0,0,0
+ FILEVERSION     1,1,0,0
+ PRODUCTVERSION  1,1,0,0
  FILEFLAGSMASK   0x3fL
  FILEFLAGS       0x0L
  FILEOS          VOS_NT_WINDOWS32
@@ -37,11 +37,11 @@ BEGIN
         BEGIN
             VALUE "FileDescription",  "华为笔记本充电保护功能"
             VALUE "ProductName",      "华为笔记本充电保护"
-            VALUE "FileVersion",      "1.0.0.0"
-            VALUE "ProductVersion",   "1.0.0.0"
+            VALUE "FileVersion",      "1.1.0.0"
+            VALUE "ProductVersion",   "1.1.0.0"
             VALUE "InternalName",     "hwbattery"
             VALUE "OriginalFilename", "hwbattery.exe"
-            VALUE "Comments",         "通过 ACPI-WMI (HWMI 命令字 0x1003) 设置充电阈值；容量与健康度经 SetupAPI/IOCTL 读取"
+            VALUE "Comments",         "通过 ACPI-WMI (HWMI 命令字 0x1503) 设置充电阈值；容量与健康度经 SetupAPI/IOCTL 读取"
             VALUE "CompanyName",      ""
             VALUE "LegalCopyright",   ""
         END
@@ -51,11 +51,11 @@ BEGIN
         BEGIN
             VALUE "FileDescription",  "Huawei laptop battery charge protection"
             VALUE "ProductName",      "Huawei laptop charge protection"
-            VALUE "FileVersion",      "1.0.0.0"
-            VALUE "ProductVersion",   "1.0.0.0"
+            VALUE "FileVersion",      "1.1.0.0"
+            VALUE "ProductVersion",   "1.1.0.0"
             VALUE "InternalName",     "hwbattery"
             VALUE "OriginalFilename", "hwbattery.exe"
-            VALUE "Comments",         "Sets the charge threshold via ACPI-WMI (HWMI command 0x1003); capacity and health are read through SetupAPI/IOCTL"
+            VALUE "Comments",         "Sets the charge threshold via ACPI-WMI (HWMI command 0x1503); capacity and health are read through SetupAPI/IOCTL"
             VALUE "CompanyName",      ""
             VALUE "LegalCopyright",   ""
         END
